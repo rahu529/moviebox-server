@@ -106,8 +106,8 @@ curl "http://127.0.0.1:8000/resolve?title=Interstellar&year=2014"
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `FASTPLAY_PROVIDER_TIMEOUT` | `9` | Per-provider timeout (seconds) |
-| `FASTPLAY_TOTAL_TIMEOUT` | `6` | Overall soft deadline; slow providers are cancelled so the phone gets partial results fast |
+| `FASTPLAY_PROVIDER_TIMEOUT` | `10` | Per-request timeout (seconds); direct/regional scrapers need 8-10s on cloud networks |
+| `FASTPLAY_TOTAL_TIMEOUT` | `12` | Overall soft deadline; slow providers are cancelled so the phone still gets partial results |
 | `FASTPLAY_CACHE_TTL` | `300` | In-memory response cache TTL |
 | `FASTPLAY_MAX_RESULTS` | `60` | Max streams in a response |
 | `FASTPLAY_DEBRID_KEY` | empty | Real-Debrid key; Torrentio then returns direct HTTP URLs that ExoPlayer can play |
@@ -127,6 +127,21 @@ curl "http://127.0.0.1:8000/resolve?title=Interstellar&year=2014"
 | `TAMILBLASTERS_DOMAINS` | `tamilblasters.buzz,.rodeo,.art,.xyz` | Comma separated |
 | `TORRENTIO_BASE` | `https://torrentio.strem.fun` | Alternate Torrentio mirror |
 | `HTTP_PROXY` / `HTTPS_PROXY` | unset | Honoured via `trust_env` (useful on ISP-blocked networks) |
+
+## Provider diagnostics
+
+Every provider and mirror failure prints one clean stdout line, so Render/Koyeb
+logs show the exact cloud-side reason instead of an empty stream list:
+
+```text
+[1337x] failed: HTTP 403 for https://1337x.to/search/Inception/1/
+[YTS] failed: timeout after 10s for https://yts.lt/api/v2/list_movies.json
+[TamilBlasters] failed: all mirrors returned no search results (403/blocked or markup changed)
+```
+
+Requests use a current Chrome User-Agent, `Accept-Language: hi,en-US;q=0.9,en;q=0.8`,
+same-origin `Referer`, and browser `Sec-Fetch-*` headers. Mirror lists are raced
+in parallel, so one dead datacenter route does not consume the whole timeout.
 
 ## Playback reality check
 

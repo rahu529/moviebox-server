@@ -13,8 +13,8 @@ Run locally:
     uvicorn fastplay_service:app --host 0.0.0.0 --port 8000 --reload
 
 Environment (all optional):
-    FASTPLAY_PROVIDER_TIMEOUT  per-provider timeout seconds (default 9)
-    FASTPLAY_TOTAL_TIMEOUT     overall soft deadline seconds (default 6)
+    FASTPLAY_PROVIDER_TIMEOUT  per-provider timeout seconds (default 10)
+    FASTPLAY_TOTAL_TIMEOUT     overall soft deadline seconds (default 12)
     FASTPLAY_CACHE_TTL         response cache seconds (default 300)
     FASTPLAY_MAX_RESULTS       max streams returned (default 60)
     FASTPLAY_DEBRID_KEY        Real-Debrid API key for Torrentio direct URLs
@@ -52,9 +52,10 @@ import os
 import re
 import struct
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import quote, quote_plus, urljoin
+from urllib.parse import quote, quote_plus, urljoin, urlsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -70,8 +71,8 @@ except Exception:  # pragma: no cover - optional dependency, provider disables i
 APP_VERSION = "1.0.0"
 LOG = logging.getLogger("fastplay")
 
-PROVIDER_TIMEOUT = float(os.getenv("FASTPLAY_PROVIDER_TIMEOUT", "9"))
-TOTAL_TIMEOUT = float(os.getenv("FASTPLAY_TOTAL_TIMEOUT", "6"))
+PROVIDER_TIMEOUT = float(os.getenv("FASTPLAY_PROVIDER_TIMEOUT", "10"))
+TOTAL_TIMEOUT = float(os.getenv("FASTPLAY_TOTAL_TIMEOUT", "12"))
 CACHE_TTL = int(os.getenv("FASTPLAY_CACHE_TTL", "300"))
 MAX_RESULTS = int(os.getenv("FASTPLAY_MAX_RESULTS", "60"))
 
@@ -97,20 +98,24 @@ VIDLINK_SECRETBOX_KEY = os.getenv(
     "c75136c5668bbfe65a7ecad431a745db68b5f381555b38d8f6c699449cf11fcd",
 ).strip()
 VIDLINK_ATTEMPTS = max(1, int(os.getenv("VIDLINK_ATTEMPTS", "8")))
+
+# A current desktop Chrome fingerprint. Datacenter IPs are already suspicious;
+# the default aiohttp UA makes the block immediate on several scrapers.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+
 VIDLINK_API_HEADERS = {
     # `hls-h264` returns per-quality MP4 files (VidLink still labels the codec
     # HEVC in metadata); `dash-hevc` returns an .mpd playlist instead.
     "x-playback-environment": "hls-h264",
-    # Its edge rejects the default aiohttp UA more often than a browser UA.
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": BROWSER_USER_AGENT,
     "Cookie": "mdd=0",
     "Priority": "u=1, i",
     "Accept": "*/*",
-    "Accept-Language": "en-US",
-    "sec-ch-ua": '"Not?A_Brand";v="24", "Chromium";v="152"',
+    "Accept-Language": "hi,en-US;q=0.9,en;q=0.8",
+    "sec-ch-ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "empty",
@@ -119,13 +124,32 @@ VIDLINK_API_HEADERS = {
 }
 
 DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    "User-Agent": BROWSER_USER_AGENT,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/json;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
     ),
-    "Accept": "text/html,application/json,application/xhtml+xml,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+    "Accept-Language": "hi,en-US;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "sec-ch-ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
+
+_CURRENT_PROVIDER: ContextVar[str] = ContextVar("fastplay_provider", default="fastplay")
+
+
+def _provider_failure(message: str) -> None:
+    """Print one clean line per failure so Render/Koyeb logs stay readable."""
+    print(f"[{_CURRENT_PROVIDER.get()}] failed: {message}", flush=True)
+
 
 QUALITY_ORDER = {
     "4K": 5,
@@ -465,28 +489,57 @@ class Stream:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _request_headers(url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Browser-like headers with a same-origin Referer for anti-bot checks."""
+    merged = dict(DEFAULT_HEADERS)
+    if headers:
+        merged.update(headers)
+    parsed = urlsplit(url)
+    if parsed.scheme and parsed.netloc and "Referer" not in merged:
+        merged["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+        if merged.get("Sec-Fetch-Site") == "none":
+            merged["Sec-Fetch-Site"] = "same-origin"
+    if "json" in merged.get("Accept", "").lower():
+        # XHR/fetch fingerprint for JSON APIs instead of a document navigation.
+        merged.pop("Sec-Fetch-User", None)
+        merged.pop("Upgrade-Insecure-Requests", None)
+        merged.update({
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+    return merged
+
+
 async def _get_text(
     session: aiohttp.ClientSession,
     url: str,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
+    request_headers = _request_headers(url, headers)
     try:
-        merged = dict(DEFAULT_HEADERS)
-        if headers:
-            merged.update(headers)
         async with session.get(
             url,
             params=params,
-            headers=merged,
+            headers=request_headers,
             timeout=aiohttp.ClientTimeout(total=PROVIDER_TIMEOUT),
             allow_redirects=True,
         ) as response:
             if response.status >= 400:
+                _provider_failure(f"HTTP {response.status} for {url}")
                 LOG.debug("GET %s -> HTTP %s", url, response.status)
                 return None
             return await response.text(errors="ignore")
+    except asyncio.TimeoutError:
+        _provider_failure(f"timeout after {PROVIDER_TIMEOUT:.0f}s for {url}")
+        return None
+    except aiohttp.ClientResponseError as exc:
+        _provider_failure(f"HTTP {exc.status} for {url}")
+        LOG.debug("GET %s failed: %s", url, exc)
+        return None
     except Exception as exc:  # network / TLS / timeout - provider is best effort
+        _provider_failure(f"{type(exc).__name__}: {exc} for {url}")
         LOG.debug("GET %s failed: %s", url, exc)
         return None
 
@@ -508,6 +561,33 @@ def _mirrors(env_key: str, defaults: Sequence[str]) -> List[str]:
     raw = os.getenv(env_key, "").strip()
     values = [v.strip().rstrip("/") for v in raw.split(",") if v.strip()] if raw else []
     return values or list(defaults)
+
+
+async def _first_result(awaitables: Iterable[Any]) -> Optional[Any]:
+    """Race mirror requests and return the first non-empty result.
+
+    Datacenter deployments often have one dead/blocked mirror per provider.
+    Querying mirrors sequentially burns the whole provider budget on that one
+    host and makes the provider look empty, so race them instead.
+    """
+    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            try:
+                result = await completed
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOG.debug("mirror attempt failed: %s", exc)
+                continue
+            if result:
+                return result
+        return None
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -842,15 +922,18 @@ def _parse_vidlink_payload(payload: Any, ctx: Context) -> List[Stream]:
 async def fetch_vidlink(session: aiohttp.ClientSession, ctx: Context) -> List[Stream]:
     """VidLink private API -> direct MP4/HLS qualities (no debrid required)."""
     if SecretBox is None or not VIDLINK_SECRETBOX_KEY:
+        _provider_failure("PyNaCl or VIDLINK_SECRETBOX_KEY is not configured")
         return []
     tmdb_id = ctx.tmdb_id
     if not tmdb_id:
         try:
-            tmdb_id = await asyncio.wait_for(resolve_tmdb_id(session, ctx), timeout=3.0)
+            tmdb_id = await asyncio.wait_for(resolve_tmdb_id(session, ctx), timeout=5.0)
         except Exception as exc:
+            _provider_failure(f"TMDB id lookup: {exc}")
             LOG.debug("VidLink TMDB lookup failed: %s", exc)
             return []
     if not tmdb_id:
+        _provider_failure("TMDB id could not be resolved")
         return []
 
     if ctx.is_tv:
@@ -864,38 +947,53 @@ async def fetch_vidlink(session: aiohttp.ClientSession, ctx: Context) -> List[St
     headers["Origin"] = VIDLINK_BASE
 
     payload: Any = None
-    # Leave enough of the aggregator's 6s soft deadline for ranking/serialising.
-    deadline = time.monotonic() + max(2.0, TOTAL_TIMEOUT - 1.5)
+    # Direct providers get 8-10s on cloud deployments. The previous 4-5s window
+    # was too short for a cold datacenter -> origin TLS handshake.
+    deadline = time.monotonic() + max(8.0, TOTAL_TIMEOUT - 2.0)
+    last_error = ""
     for attempt in range(VIDLINK_ATTEMPTS):
         remaining = deadline - time.monotonic()
         if remaining <= 0.2:
+            last_error = "deadline reached"
             break
         # The token is single-use: every retry needs a fresh timestamp/token,
         # otherwise the API answers `null` for all but the first attempt.
         token = _vidlink_token(tmdb_id)
         if not token:
+            last_error = "token generation failed"
             break
         url = f"{VIDLINK_BASE}{path_template.format(token=token)}?multiLang=0"
         try:
             async with session.get(
                 url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=min(1.8, remaining)),
+                headers=_request_headers(url, headers),
+                timeout=aiohttp.ClientTimeout(total=min(4.0, remaining)),
                 allow_redirects=True,
             ) as response:
                 if response.status != 200:
+                    last_error = f"HTTP {response.status} (attempt {attempt + 1}/{VIDLINK_ATTEMPTS})"
+                    _provider_failure(last_error)
                     continue
                 text = await response.text(errors="ignore")
             text = (text or "").strip()
             if not text or text == "null":
+                last_error = f"empty response (attempt {attempt + 1}/{VIDLINK_ATTEMPTS})"
                 continue
             payload = json.loads(text)
             break
         except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc} (attempt {attempt + 1}/{VIDLINK_ATTEMPTS})"
             LOG.debug("VidLink attempt %s/%s failed: %s", attempt + 1, VIDLINK_ATTEMPTS, exc)
         if attempt + 1 < VIDLINK_ATTEMPTS:
             await asyncio.sleep(0.1)
-    return _parse_vidlink_payload(payload, ctx)
+
+    if payload is None:
+        _provider_failure(last_error or "no response from VidLink")
+        return []
+    streams = _parse_vidlink_payload(payload, ctx)
+    if not streams:
+        _provider_failure("response contained no playable qualities")
+    return streams
 
 
 async def fetch_yts(session: aiohttp.ClientSession, ctx: Context) -> List[Stream]:
@@ -906,19 +1004,23 @@ async def fetch_yts(session: aiohttp.ClientSession, ctx: Context) -> List[Stream
     if not query:
         return []
     bases = _mirrors("YTS_MIRRORS", ("https://yts.mx", "https://yts.lt", "https://yts.am", "https://yts.rs"))
-    payload = None
-    for base in bases:
+
+    async def load(base: str) -> Optional[Any]:
         payload = await _get_json(
             session,
             f"{base}/api/v2/list_movies.json",
             params={"query_term": query, "limit": 20, "sort_by": "seeds"},
         )
-        if payload:
-            break
+        return payload if isinstance(payload, dict) else None
+
+    payload = await _first_result(load(base) for base in bases)
     if not isinstance(payload, dict):
+        _provider_failure("no JSON payload from any YTS mirror")
         return []
 
     movies = ((payload.get("data") or {}).get("movies") or []) if isinstance(payload.get("data"), dict) else []
+    if not movies:
+        _provider_failure("YTS returned no matching movies")
     streams: List[Stream] = []
     for movie in movies:
         if not isinstance(movie, dict):
@@ -1044,6 +1146,7 @@ def _parse_torrentio_stream(item: Dict[str, Any]) -> Optional[Stream]:
 async def fetch_torrentio(session: aiohttp.ClientSession, ctx: Context) -> List[Stream]:
     """Torrentio aggregator (YTS, EZTV, 1337x, TorrentGalaxy, RARBG, ...)."""
     if not ctx.imdb:
+        _provider_failure("IMDb id is missing; Torrentio requires one")
         return []
     base = os.getenv("TORRENTIO_BASE", "https://torrentio.strem.fun").rstrip("/")
     debrid = os.getenv("FASTPLAY_DEBRID_KEY", "").strip()
@@ -1051,6 +1154,7 @@ async def fetch_torrentio(session: aiohttp.ClientSession, ctx: Context) -> List[
     kind = "series" if ctx.is_tv else "movie"
     payload = await _get_json(session, f"{base}/{prefix}stream/{kind}/{ctx.imdb}.json")
     if not isinstance(payload, dict):
+        _provider_failure("no JSON payload (blocked, timed out, or format changed)")
         return []
 
     streams: List[Stream] = []
@@ -1060,6 +1164,8 @@ async def fetch_torrentio(session: aiohttp.ClientSession, ctx: Context) -> List[
         stream = _parse_torrentio_stream(item)
         if stream:
             streams.append(stream)
+    if not streams:
+        _provider_failure("response contained no usable streams")
     return streams
 
 
@@ -1074,12 +1180,18 @@ async def fetch_eztv(session: aiohttp.ClientSession, ctx: Context) -> List[Strea
         return []
 
     bases = _mirrors("EZTV_MIRRORS", ("https://eztv.re", "https://eztv.wf", "https://eztv.tf", "https://eztv.yt"))
-    payload = None
-    for base in bases:
-        payload = await _get_json(session, f"{base}/api/get-torrents", params={"imdb_id": numeric, "limit": 100})
-        if isinstance(payload, dict):
-            break
+
+    async def load(base: str) -> Optional[Any]:
+        payload = await _get_json(
+            session,
+            f"{base}/api/get-torrents",
+            params={"imdb_id": numeric, "limit": 100},
+        )
+        return payload if isinstance(payload, dict) else None
+
+    payload = await _first_result(load(base) for base in bases)
     if not isinstance(payload, dict):
+        _provider_failure("no JSON payload from any EZTV mirror")
         return []
 
     streams: List[Stream] = []
@@ -1113,6 +1225,8 @@ async def fetch_eztv(session: aiohttp.ClientSession, ctx: Context) -> List[Strea
                 source_type="torrent",
             )
         )
+    if not streams:
+        _provider_failure("no matching episodes in EZTV response")
     return streams
 
 
@@ -1132,18 +1246,21 @@ async def fetch_1337x(session: aiohttp.ClientSession, ctx: Context) -> List[Stre
     if not query:
         return []
     bases = _mirrors("X1337_MIRRORS", ("https://1337x.to", "https://1337x.st", "https://x1337x.ws", "https://1337x.gd"))
-    soup: Optional[BeautifulSoup] = None
-    active_base = ""
-    for base in bases:
+
+    async def load(base: str) -> Optional[Any]:
         text = await _get_text(session, f"{base}/search/{quote(query)}/1/")
-        if text:
-            candidate_soup = BeautifulSoup(text, "html.parser")
-            if candidate_soup.select("table.table-list tbody tr"):
-                soup = candidate_soup
-                active_base = base.rstrip("/")
-                break
-    if soup is None or not active_base:
+        if not text:
+            return None
+        candidate_soup = BeautifulSoup(text, "html.parser")
+        if not candidate_soup.select("table.table-list tbody tr"):
+            return None
+        return base.rstrip("/"), candidate_soup
+
+    found = await _first_result(load(base) for base in bases)
+    if not found:
+        _provider_failure("all mirrors returned no search results (403/blocked or markup changed)")
         return []
+    active_base, soup = found
 
     candidates: List[Dict[str, Any]] = []
     for row in soup.select("table.table-list tbody tr")[:8]:
@@ -1166,6 +1283,10 @@ async def fetch_1337x(session: aiohttp.ClientSession, ctx: Context) -> List[Stre
                 "size_text": size_node.get_text(strip=True) if size_node else "",
             }
         )
+
+    if not candidates:
+        _provider_failure("search page had no usable result rows")
+        return []
 
     streams: List[Stream] = []
 
@@ -1204,7 +1325,12 @@ async def fetch_1337x(session: aiohttp.ClientSession, ctx: Context) -> List[Stre
         async with semaphore:
             await load_detail(candidate)
 
-    await asyncio.gather(*(guarded(c) for c in candidates), return_exceptions=True)
+    results = await asyncio.gather(*(guarded(c) for c in candidates), return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            _provider_failure(f"detail page: {result}")
+    if not streams:
+        _provider_failure("no magnet links found in 1337x detail pages")
     return streams
 
 
@@ -1214,18 +1340,21 @@ async def fetch_torrentgalaxy(session: aiohttp.ClientSession, ctx: Context) -> L
     if not query:
         return []
     bases = _mirrors("TGX_MIRRORS", ("https://torrentgalaxy.to", "https://torrentgalaxy.mx", "https://tgx.rs"))
-    soup: Optional[BeautifulSoup] = None
-    for base in bases:
+
+    async def load(base: str) -> Optional[Any]:
         text = await _get_text(
             session,
             f"{base}/torrents.php",
             params={"search": query, "sort": "seeders", "order": "desc"},
         )
-        if text:
-            soup = BeautifulSoup(text, "html.parser")
-            if soup.select("div.tgxtablerow"):
-                break
+        if not text:
+            return None
+        candidate_soup = BeautifulSoup(text, "html.parser")
+        return candidate_soup if candidate_soup.select("div.tgxtablerow") else None
+
+    soup = await _first_result(load(base) for base in bases)
     if soup is None:
+        _provider_failure("all mirrors returned no search page (403/blocked or markup changed)")
         return []
 
     streams: List[Stream] = []
@@ -1256,6 +1385,8 @@ async def fetch_torrentgalaxy(session: aiohttp.ClientSession, ctx: Context) -> L
                 source_type="torrent",
             )
         )
+    if not streams:
+        _provider_failure("search page contained no magnet rows")
     return streams
 
 
@@ -1270,22 +1401,24 @@ async def _fetch_invision_source(
     if not query:
         return []
 
-    search_soup: Optional[BeautifulSoup] = None
-    active_base = ""
-    for base in bases:
+    async def load(base: str) -> Optional[Any]:
         search_url = (
             f"{base.rstrip('/')}/index.php?/search/&q={quote_plus(query)}"
             "&quick=1&type=forums_topic"
         )
         text = await _get_text(session, search_url)
-        if text:
-            candidate_soup = BeautifulSoup(text, "html.parser")
-            if candidate_soup.select('a[href*="/topic/"]'):
-                search_soup = candidate_soup
-                active_base = base.rstrip("/")
-                break
-    if search_soup is None or not active_base:
+        if not text:
+            return None
+        candidate_soup = BeautifulSoup(text, "html.parser")
+        if not candidate_soup.select('a[href*="/topic/"]'):
+            return None
+        return base.rstrip("/"), candidate_soup
+
+    found = await _first_result(load(base) for base in bases)
+    if not found:
+        _provider_failure("all mirrors returned no search results (403/blocked or markup changed)")
         return []
+    active_base, search_soup = found
 
     topic_links: List[Tuple[str, str]] = []
     seen = set()
@@ -1299,6 +1432,7 @@ async def _fetch_invision_source(
         if len(topic_links) >= 6:
             break
     if not topic_links:
+        _provider_failure("search page had no topic links")
         return []
 
     streams: List[Stream] = []
@@ -1332,7 +1466,15 @@ async def _fetch_invision_source(
                     )
                 )
 
-    await asyncio.gather(*(load_topic(href, title) for href, title in topic_links), return_exceptions=True)
+    results = await asyncio.gather(
+        *(load_topic(href, title) for href, title in topic_links),
+        return_exceptions=True,
+    )
+    for result in results:
+        if isinstance(result, Exception):
+            _provider_failure(f"topic page: {result}")
+    if not streams:
+        _provider_failure("topic pages contained no magnet links")
     return streams
 
 
@@ -1441,8 +1583,9 @@ def _sort_streams(streams: List[Stream]) -> List[Stream]:
 
 async def _run_provider(name: str, fn: Any, session: aiohttp.ClientSession, ctx: Context) -> Dict[str, Any]:
     started = time.perf_counter()
+    token = _CURRENT_PROVIDER.set(name)
     try:
-        streams = await asyncio.wait_for(fn(session, ctx), timeout=PROVIDER_TIMEOUT + 4)
+        streams = await asyncio.wait_for(fn(session, ctx), timeout=PROVIDER_TIMEOUT + 2)
         if not isinstance(streams, list):
             streams = []
         return {
@@ -1452,8 +1595,19 @@ async def _run_provider(name: str, fn: Any, session: aiohttp.ClientSession, ctx:
             "ms": int((time.perf_counter() - started) * 1000),
             "streams": streams,
         }
+    except asyncio.TimeoutError:
+        _provider_failure(f"timed out after {PROVIDER_TIMEOUT + 2:.0f}s")
+        return {
+            "name": name,
+            "ok": False,
+            "count": 0,
+            "ms": int((time.perf_counter() - started) * 1000),
+            "error": f"timed out after {PROVIDER_TIMEOUT + 2:.0f}s",
+            "streams": [],
+        }
     except Exception as exc:
-        LOG.info("provider %s failed: %s", name, exc)
+        _provider_failure(str(exc))
+        LOG.exception("provider %s failed", name)
         return {
             "name": name,
             "ok": False,
@@ -1462,6 +1616,8 @@ async def _run_provider(name: str, fn: Any, session: aiohttp.ClientSession, ctx:
             "error": str(exc)[:200],
             "streams": [],
         }
+    finally:
+        _CURRENT_PROVIDER.reset(token)
 
 
 def build_context(
@@ -1506,7 +1662,11 @@ async def aggregate(ctx: Context) -> Dict[str, Any]:
 
     started = time.perf_counter()
     connector = aiohttp.TCPConnector(limit=40, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(connector=connector, trust_env=True) as session:
+    async with aiohttp.ClientSession(
+        connector=connector,
+        trust_env=True,
+        headers=DEFAULT_HEADERS,
+    ) as session:
         tasks = {
             asyncio.create_task(_run_provider(name, fn, session, ctx)): name
             for name, fn in PROVIDERS
@@ -1523,11 +1683,13 @@ async def aggregate(ctx: Context) -> Dict[str, Any]:
                 try:
                     reports.append(task.result())
                 except Exception as exc:  # defensive: provider must never break the response
+                    print(f"[{name}] failed: {exc}", flush=True)
                     reports.append(
                         {"name": name, "ok": False, "count": 0, "ms": 0,
                          "error": str(exc)[:200], "streams": []}
                     )
             else:
+                print(f"[{name}] failed: timed out after {TOTAL_TIMEOUT:.0f}s", flush=True)
                 reports.append(
                     {"name": name, "ok": False, "count": 0,
                      "ms": int(TOTAL_TIMEOUT * 1000), "error": "timed out", "streams": []}
@@ -1689,6 +1851,7 @@ async def health() -> Dict[str, Any]:
         "providers": [name for name, _ in PROVIDERS],
         "cacheEntries": len(_CACHE),
         "cacheTtlSeconds": CACHE_TTL,
+        "providerTimeoutSeconds": PROVIDER_TIMEOUT,
         "totalTimeoutSeconds": TOTAL_TIMEOUT,
         "debridConfigured": bool(os.getenv("FASTPLAY_DEBRID_KEY", "").strip()),
         "tmdbConfigured": bool(TMDB_API_KEY),
