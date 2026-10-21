@@ -6,8 +6,11 @@ Run from the repository root:
 These tests do not touch the network: provider payloads are mocked.
 """
 
+import base64
 import os
+import struct
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -239,6 +242,72 @@ class ImdbResolutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
 
 
+class VidLinkTests(unittest.TestCase):
+    @unittest.skipIf(fp.SecretBox is None, "PyNaCl is not installed")
+    def test_token_round_trip(self):
+        token = fp._vidlink_token(550)
+        self.assertIsNotNone(token)
+        raw = base64.urlsafe_b64decode(token + "=" * ((4 - len(token) % 4) % 4))
+        self.assertEqual(raw[:24], b"\x00" * 24)
+        box = fp.SecretBox(bytes.fromhex(fp.VIDLINK_SECRETBOX_KEY))
+        plain = box.decrypt(raw[24:], raw[:24])
+        self.assertEqual(plain[:7], b"550\x00\x00\x00\x00")
+        stamp = struct.unpack(">I", plain[-4:])[0]
+        self.assertLessEqual(abs(stamp - int(time.time())), 5)
+
+    def test_parse_qualities_marks_direct_mp4(self):
+        payload = {
+            "sourceId": "mwVault",
+            "stream": {
+                "qualities": {
+                    "1080": {"url": "https://cdn.example.com/1080.mp4?sig=1",
+                             "codecName": "hevc", "size": "500000000"},
+                    "720": {"url": "https://cdn.example.com/720.m3u8?sig=2",
+                            "codecName": "h264", "size": "250000000"},
+                },
+                "playlistHeaders": {},
+            },
+        }
+        ctx = fp.build_context("tt0137523", "Fight Club", 1999)
+        streams = fp._parse_vidlink_payload(payload, ctx)
+        self.assertEqual(len(streams), 2)
+        best = next(s for s in streams if s.quality == "1080p")
+        self.assertTrue(best.is_direct)
+        self.assertTrue(best.playable)
+        self.assertEqual(best.source_type, "mp4")
+        self.assertEqual(best.playback_url, "https://cdn.example.com/1080.mp4?sig=1")
+        hls = next(s for s in streams if s.quality == "720p")
+        self.assertEqual(hls.source_type, "hls")
+
+    def test_normalise_preserves_mp4_source_type(self):
+        stream = fp.Stream(
+            provider="VidLink",
+            title="Fight Club [1080p] [VidLink]",
+            quality="1080p",
+            url="https://cdn.example.com/1080.mp4",
+            is_direct=True,
+            source_type="mp4",
+        ).to_dict()
+        normalised = fp._normalise_stream_flags(stream)
+        self.assertTrue(normalised["isDirect"])
+        self.assertTrue(normalised["playable"])
+        self.assertEqual(normalised["sourceType"], "mp4")
+
+
+class TmdbIdTests(unittest.IsolatedAsyncioTestCase):
+    async def test_imdb_find_returns_tmdb_id(self):
+        async def fake_json(session, url, params=None):
+            if "/find/tt0816692" in url:
+                return {"movie_results": [{"id": 157336, "title": "Interstellar"}]}
+            return None
+
+        ctx = fp.build_context("tt0816692", "Interstellar", 2014)
+        with patch.object(fp, "_get_json", fake_json):
+            tmdb_id = await fp.resolve_tmdb_id(None, ctx)
+        self.assertEqual(tmdb_id, 157336)
+        self.assertEqual(ctx.tmdb_id, 157336)
+
+
 class RankingTests(unittest.TestCase):
     def _stream(self, quality, languages, seeders, direct=False, title=""):
         return fp.Stream(
@@ -272,6 +341,32 @@ class RankingTests(unittest.TestCase):
         self.assertEqual(picked["streamUrl"], "https://example.com/stream.m3u8")
         self.assertTrue(picked["isDirect"])
         self.assertFalse(picked["isMagnet"])
+
+    def test_direct_stream_sorts_before_hindi_magnets(self):
+        direct = fp.Stream(
+            provider="VidLink",
+            title="Movie [720p] [VidLink]",
+            quality="720p",
+            languages=[],
+            url="https://cdn.example.com/stream.mp4",
+            is_direct=True,
+            source_type="mp4",
+        )
+        hindi_magnets = [
+            fp.Stream(
+                provider="Torrentio",
+                title=f"Movie {quality} Hindi Dual Audio",
+                quality=quality,
+                languages=["Hindi", "Dual Audio"],
+                seeders=5000,
+                magnet="magnet:?xt=urn:btih:abc",
+                info_hash=f"hash-{index}",
+            )
+            for index, quality in enumerate(("1080p", "4K", "1080p"))
+        ]
+        ordered = fp._sort_streams([*hindi_magnets, direct])
+        self.assertIs(ordered[0], direct)
+        self.assertTrue(ordered[0].playable)
 
     def test_magnet_flags_are_forced_to_not_direct(self):
         stream = self._stream("1080p", ["Hindi"], 500)

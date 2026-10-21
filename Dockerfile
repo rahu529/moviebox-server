@@ -4,12 +4,15 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
     PORT=8000
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY fastplay_service.py ./
 
+# Koyeb injects PORT at runtime; ${PORT:-8000} keeps local docker runs working.
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn fastplay_service:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn fastplay_service:app --host 0.0.0.0 --port ${PORT:-8000}"]

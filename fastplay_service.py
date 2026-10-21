@@ -21,6 +21,11 @@ Environment (all optional):
     TMDB_API_KEY               TMDB key used to auto-resolve IMDb ids
     TMDB_PROXY_URL             TMDB API proxy base (default /3 worker)
     CINEMETA_BASE              Cinemeta fallback base URL
+    VIDLINK_BASE               VidLink base URL (default https://vidlink.pro)
+    VIDLINK_SECRETBOX_KEY      VidLink token key, hex (defaults to the key
+                               shipped in the current VidLink player bundle)
+    VIDLINK_ATTEMPTS           VidLink API retries (default 8; its edge nodes
+                               intermittently answer `null`)
     FASTPLAY_IMDB_CACHE_TTL    positive IMDb lookup cache seconds (default 86400)
     YTS_MIRRORS                comma separated YTS mirrors
     TGX_MIRRORS                comma separated TorrentGalaxy mirrors
@@ -29,19 +34,23 @@ Environment (all optional):
     TAMILBLASTERS_DOMAINS      comma separated TamilBlasters domains
     HTTP_PROXY / HTTPS_PROXY   honoured automatically (trust_env)
 
-NOTE: without a debrid key most sources return *magnet* links. ExoPlayer
-cannot open a magnet URI; the Android app therefore hands magnets to an
-installed torrent/VLC client and plays direct HTTP streams in-app.
+NOTE: without a debrid key most sources return *magnet* links. The Android app
+plays those magnets with its embedded libtorrent4j engine, which exposes a
+localhost HTTP stream to ExoPlayer. Direct HTTP streams still bypass the
+torrent engine and start immediately.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import json
 import logging
 import math
 import os
 import re
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -52,6 +61,11 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+try:  # PyNaCl provides the XSalsa20-Poly1305 box VidLink uses.
+    from nacl.secret import SecretBox
+except Exception:  # pragma: no cover - optional dependency, provider disables itself
+    SecretBox = None  # type: ignore[assignment]
 
 APP_VERSION = "1.0.0"
 LOG = logging.getLogger("fastplay")
@@ -72,6 +86,37 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY", "59fa8f04083deff6e81e42d34daf9524").str
 CINEMETA_BASE = os.getenv("CINEMETA_BASE", "https://v3-cinemeta.strem.io").rstrip("/")
 IMDB_CACHE_TTL = int(os.getenv("FASTPLAY_IMDB_CACHE_TTL", "86400"))
 IMDB_NEGATIVE_TTL = int(os.getenv("FASTPLAY_IMDB_NEGATIVE_TTL", "600"))
+
+# VidLink is the direct-play provider. It encrypts a tiny `tmdbId + timestamp`
+# payload with libsodium's secretbox (24-byte zero nonce) before calling its
+# private API. The key below is the one embedded in its current Go/WASM player
+# bundle; override it with VIDLINK_SECRETBOX_KEY if VidLink rotates the key.
+VIDLINK_BASE = os.getenv("VIDLINK_BASE", "https://vidlink.pro").rstrip("/")
+VIDLINK_SECRETBOX_KEY = os.getenv(
+    "VIDLINK_SECRETBOX_KEY",
+    "c75136c5668bbfe65a7ecad431a745db68b5f381555b38d8f6c699449cf11fcd",
+).strip()
+VIDLINK_ATTEMPTS = max(1, int(os.getenv("VIDLINK_ATTEMPTS", "8")))
+VIDLINK_API_HEADERS = {
+    # `hls-h264` returns per-quality MP4 files (VidLink still labels the codec
+    # HEVC in metadata); `dash-hevc` returns an .mpd playlist instead.
+    "x-playback-environment": "hls-h264",
+    # Its edge rejects the default aiohttp UA more often than a browser UA.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+    ),
+    "Cookie": "mdd=0",
+    "Priority": "u=1, i",
+    "Accept": "*/*",
+    "Accept-Language": "en-US",
+    "sec-ch-ua": '"Not?A_Brand";v="24", "Chromium";v="152"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+}
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -334,6 +379,7 @@ class Context:
     season: int = 1
     episode: int = 1
     imdb_source: str = ""
+    tmdb_id: Optional[int] = None
 
     @property
     def search_query(self) -> str:
@@ -561,6 +607,10 @@ async def _tmdb_imdb(session: aiohttp.ClientSession, ctx: Context) -> Optional[s
     tmdb_id = chosen.get("id") if chosen else None
     if not tmdb_id:
         return None
+    try:
+        ctx.tmdb_id = int(tmdb_id)
+    except (TypeError, ValueError):
+        ctx.tmdb_id = None
     external = await _get_json(
         session,
         f"{TMDB_PROXY_URL}/{kind}/{tmdb_id}/external_ids",
@@ -570,6 +620,59 @@ async def _tmdb_imdb(session: aiohttp.ClientSession, ctx: Context) -> Optional[s
     if imdb:
         LOG.info("TMDB resolved %r (%s) -> %s", ctx.title, ctx.year or "?", imdb)
     return imdb
+
+
+async def resolve_tmdb_id(session: aiohttp.ClientSession, ctx: Context) -> Optional[int]:
+    """Resolve the numeric TMDB id VidLink needs (IMDb find -> title search)."""
+    if ctx.tmdb_id:
+        return ctx.tmdb_id
+    if not TMDB_API_KEY:
+        return None
+
+    if ctx.imdb:
+        payload = await _get_json(
+            session,
+            f"{TMDB_PROXY_URL}/find/{ctx.imdb}",
+            params={"api_key": TMDB_API_KEY, "external_source": "imdb_id"},
+        )
+        if isinstance(payload, dict):
+            keys = ("tv_results", "tv_episode_results") if ctx.is_tv else ("movie_results",)
+            for key in keys:
+                for item in payload.get(key) or []:
+                    if isinstance(item, dict) and item.get("id"):
+                        ctx.tmdb_id = int(item["id"])
+                        return ctx.tmdb_id
+            # Some proxied /find responses only include one result bucket.
+            for key in ("movie_results", "tv_results"):
+                for item in payload.get(key) or []:
+                    if isinstance(item, dict) and item.get("id"):
+                        ctx.tmdb_id = int(item["id"])
+                        return ctx.tmdb_id
+
+    kind = "tv" if ctx.is_tv else "movie"
+    query = _clean_title_query(ctx.title, None) or ctx.title
+    if not query:
+        return None
+    params: Dict[str, Any] = {
+        "api_key": TMDB_API_KEY,
+        "query": query,
+        "include_adult": "false",
+        "language": "en-US",
+    }
+    if ctx.year:
+        params["first_air_date_year" if ctx.is_tv else "year"] = ctx.year
+    payload = await _get_json(session, f"{TMDB_PROXY_URL}/search/{kind}", params=params)
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not results and ctx.year:
+        params.pop("year", None)
+        params.pop("first_air_date_year", None)
+        payload = await _get_json(session, f"{TMDB_PROXY_URL}/search/{kind}", params=params)
+        results = payload.get("results") if isinstance(payload, dict) else None
+    chosen = _pick_tmdb_result(results or [], ctx)
+    tmdb_id = chosen.get("id") if chosen else None
+    if tmdb_id:
+        ctx.tmdb_id = int(tmdb_id)
+    return ctx.tmdb_id
 
 
 def _pick_cinemeta_result(metas: Sequence[Dict[str, Any]], ctx: Context) -> Optional[str]:
@@ -659,6 +762,141 @@ async def ensure_imdb(ctx: Context) -> None:
 # ---------------------------------------------------------------------------
 # providers
 # ---------------------------------------------------------------------------
+
+def _vidlink_token(tmdb_id: int) -> Optional[str]:
+    """Build the token VidLink expects: base64url(24*0x00 || secretbox(id|ts))."""
+    if SecretBox is None or not VIDLINK_SECRETBOX_KEY:
+        return None
+    try:
+        key = bytes.fromhex(VIDLINK_SECRETBOX_KEY)
+        nonce = b"\x00" * 24
+        payload = str(int(tmdb_id)).encode("ascii") + b"\x00" * 4 + struct.pack(">I", int(time.time()))
+        encrypted = bytes(SecretBox(key).encrypt(payload, nonce))[24:]
+        return base64.urlsafe_b64encode(nonce + encrypted).decode("ascii").rstrip("=")
+    except Exception as exc:
+        LOG.debug("VidLink token generation failed: %s", exc)
+        return None
+
+
+def _vidlink_quality(label: Any) -> str:
+    value = str(label or "").strip().lower().replace("p", "")
+    if value in ("2160", "4320", "4k"):
+        return "4K"
+    if value.isdigit():
+        return f"{value}p"
+    return parse_quality(value)
+
+
+def _parse_vidlink_payload(payload: Any, ctx: Context) -> List[Stream]:
+    if not isinstance(payload, dict):
+        return []
+    stream = payload.get("stream")
+    if not isinstance(stream, dict):
+        return []
+    qualities = stream.get("qualities")
+    if not isinstance(qualities, dict):
+        return []
+
+    streams: List[Stream] = []
+    for label, item in qualities.items():
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        quality = _vidlink_quality(label)
+        codec = str(item.get("codecName") or "").strip()
+        size_bytes = _to_int(item.get("size"))
+        size = _human_size(size_bytes) if size_bytes else "Unknown"
+        title = f"{ctx.title or 'VidLink'} [{quality}] [VidLink]" + (f" [{codec}]" if codec else "")
+        lower = url.lower()
+        if ".m3u8" in lower:
+            source_type = "hls"
+        elif ".mpd" in lower:
+            source_type = "dash"
+        elif ".mp4" in lower:
+            source_type = "mp4"
+        else:
+            source_type = "http"
+        headers: Dict[str, str] = {}
+        # MP4 CDN links are playable directly; only the DASH manifest carries
+        # signed CloudFront cookies that ExoPlayer needs.
+        if source_type == "dash" and isinstance(stream.get("playlistHeaders"), dict):
+            headers = {str(k): str(v) for k, v in stream["playlistHeaders"].items() if v}
+        streams.append(
+            Stream(
+                provider="VidLink",
+                title=title,
+                quality=quality,
+                size_bytes=size_bytes,
+                size=size,
+                url=url,
+                is_direct=True,
+                source_type=source_type,
+                headers=headers,
+            )
+        )
+    return streams
+
+
+async def fetch_vidlink(session: aiohttp.ClientSession, ctx: Context) -> List[Stream]:
+    """VidLink private API -> direct MP4/HLS qualities (no debrid required)."""
+    if SecretBox is None or not VIDLINK_SECRETBOX_KEY:
+        return []
+    tmdb_id = ctx.tmdb_id
+    if not tmdb_id:
+        try:
+            tmdb_id = await asyncio.wait_for(resolve_tmdb_id(session, ctx), timeout=3.0)
+        except Exception as exc:
+            LOG.debug("VidLink TMDB lookup failed: %s", exc)
+            return []
+    if not tmdb_id:
+        return []
+
+    if ctx.is_tv:
+        path_template = f"/api/b/tv/{{token}}/{ctx.season}/{ctx.episode}"
+        referer = f"{VIDLINK_BASE}/tv/{tmdb_id}/{ctx.season}/{ctx.episode}"
+    else:
+        path_template = "/api/b/movie/{token}"
+        referer = f"{VIDLINK_BASE}/movie/{tmdb_id}"
+    headers = dict(VIDLINK_API_HEADERS)
+    headers["Referer"] = referer
+    headers["Origin"] = VIDLINK_BASE
+
+    payload: Any = None
+    # Leave enough of the aggregator's 6s soft deadline for ranking/serialising.
+    deadline = time.monotonic() + max(2.0, TOTAL_TIMEOUT - 1.5)
+    for attempt in range(VIDLINK_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.2:
+            break
+        # The token is single-use: every retry needs a fresh timestamp/token,
+        # otherwise the API answers `null` for all but the first attempt.
+        token = _vidlink_token(tmdb_id)
+        if not token:
+            break
+        url = f"{VIDLINK_BASE}{path_template.format(token=token)}?multiLang=0"
+        try:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=min(1.8, remaining)),
+                allow_redirects=True,
+            ) as response:
+                if response.status != 200:
+                    continue
+                text = await response.text(errors="ignore")
+            text = (text or "").strip()
+            if not text or text == "null":
+                continue
+            payload = json.loads(text)
+            break
+        except Exception as exc:
+            LOG.debug("VidLink attempt %s/%s failed: %s", attempt + 1, VIDLINK_ATTEMPTS, exc)
+        if attempt + 1 < VIDLINK_ATTEMPTS:
+            await asyncio.sleep(0.1)
+    return _parse_vidlink_payload(payload, ctx)
+
 
 async def fetch_yts(session: aiohttp.ClientSession, ctx: Context) -> List[Stream]:
     """YTS public JSON API - high quality movie torrents with real seeders."""
@@ -1115,6 +1353,7 @@ async def fetch_tamilblasters(session: aiohttp.ClientSession, ctx: Context) -> L
 
 
 PROVIDERS: List[Tuple[str, Any]] = [
+    ("VidLink", fetch_vidlink),
     ("YTS", fetch_yts),
     ("Torrentio", fetch_torrentio),
     ("1337x", fetch_1337x),
@@ -1188,6 +1427,9 @@ def _sort_streams(streams: List[Stream]) -> List[Stream]:
     return sorted(
         streams,
         key=lambda s: (
+            # Never let MAX_RESULTS truncate a playable HTTP stream in favour
+            # of a magnet: /fast-play can only start the former in-app.
+            -int(s.playable),
             -language_priority(s.languages),
             -s.score,
             -s.seeders,
@@ -1330,7 +1572,7 @@ async def aggregate(ctx: Context) -> Dict[str, Any]:
 
 
 def _is_http_playable(stream: Dict[str, Any]) -> bool:
-    """True only for direct HTTP(S) media ExoPlayer can open without a torrent client."""
+    """True only for direct HTTP(S) media that can bypass the torrent engine."""
     if not stream.get("playable") and not stream.get("isDirect") and not stream.get("is_direct"):
         return False
     url = str(stream.get("streamUrl") or stream.get("url") or "").lower()
@@ -1356,7 +1598,9 @@ def _normalise_stream_flags(stream: Dict[str, Any]) -> Dict[str, Any]:
         stream["isMagnet"] = False
         stream["playable"] = direct
         if direct:
-            stream["sourceType"] = "http"
+            source_type = str(stream.get("sourceType") or "").lower()
+            if source_type not in ("hls", "mp4", "dash", "http"):
+                stream["sourceType"] = "http"
     else:
         stream["isDirect"] = False
         stream["is_direct"] = False
@@ -1450,6 +1694,8 @@ async def health() -> Dict[str, Any]:
         "tmdbConfigured": bool(TMDB_API_KEY),
         "tmdbProxy": TMDB_PROXY_URL,
         "cinemetaBase": CINEMETA_BASE,
+        "vidlinkConfigured": bool(SecretBox is not None and VIDLINK_SECRETBOX_KEY),
+        "vidlinkBase": VIDLINK_BASE,
         "imdbCacheEntries": len(_IMDB_CACHE),
     }
 
@@ -1512,9 +1758,10 @@ if __name__ == "__main__":
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "fastplay_service:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
+        host="0.0.0.0",
+        port=port,
         reload=os.getenv("RELOAD", "0") == "1",
     )
